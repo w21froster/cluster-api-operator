@@ -121,7 +121,7 @@ func moveProvider(ctx context.Context, opts *moveOptions) error {
 		return fromDirectory(ctx, opts)
 	}
 
-	return moveProvider(ctx, opts)
+	return move(ctx, opts)
 }
 
 func move(ctx context.Context, opts *moveOptions) error {
