@@ -28454,7 +28454,7 @@ spec:
         - --leader-elect=true
         command:
         - /manager
-        image: "gcr.io/k8s-staging-capi-operator/cluster-api-operator:v20250129-v0.16.0"
+        image: "gcr.io/k8s-staging-capi-operator/cluster-api-operator:dev"
         imagePullPolicy: IfNotPresent
         name: manager
         ports:
