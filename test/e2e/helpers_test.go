@@ -27,9 +27,10 @@ import (
 var ctx = context.Background()
 
 const (
-	operatorNamespace   = "capi-operator-system"
-	capiSystemNamespace = "capi-system"
-	capiOperatorRelease = "capi-operator"
+	operatorNamespace    = "capi-operator-system"
+	capkbSystemNamespace = "capi-kubeadm-bootstrap-system"
+	capiSystemNamespace  = "capi-system"
+	capiOperatorRelease  = "capi-operator"
 
 	previousCAPIVersion = "v1.7.7"
 
@@ -52,5 +53,6 @@ const (
 	ipamProviderURL            = "https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster/releases/latest/ipam-components.yaml"
 	ipamProviderDeploymentName = "capi-ipam-in-cluster-controller-manager"
 
-	customManifestsFolder = "resources/"
+	customBootstrapProviderName = "kubeadm-custom"
+	customManifestsFolder       = "resources/"
 )

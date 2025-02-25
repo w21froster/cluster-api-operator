@@ -34,34 +34,42 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-var _ = Describe("Install Core Provider in an air-gapped environment", func() {
-	It("should successfully create config maps with Core Provider manifests", func() {
+var _ = Describe("Install Core & Bootstrap Providers in an air-gapped environment", func() {
+	It("should successfully create config maps with Core and Bootstrap Provider manifests", func() {
 		// Ensure that there are no Cluster API installed
 		deleteClusterAPICRDs(bootstrapClusterProxy)
 
 		bootstrapCluster := bootstrapClusterProxy.GetClient()
 		configMaps := []corev1.ConfigMap{}
+		configMapFiles := []string{
+			"core-cluster-api-v1.7.7.yaml",
+			"core-cluster-api-v1.8.0.yaml",
+			"bootstrap-kubeadm-v1.7.7.yaml",
+			"bootstrap-kubeadm-v1.8.0.yaml",
+		}
 
-		for _, fileName := range []string{"core-cluster-api-v1.7.7.yaml", "core-cluster-api-v1.8.0.yaml"} {
-			coreProviderComponents, err := os.ReadFile(customManifestsFolder + fileName)
-			Expect(err).ToNot(HaveOccurred(), "Failed to read the core provider manifests file")
+		for _, fileName := range configMapFiles {
+			providerComponents, err := os.ReadFile(customManifestsFolder + fileName)
+			Expect(err).ToNot(HaveOccurred(), "Failed to read the provider manifests file")
 
 			var configMap corev1.ConfigMap
 
-			Expect(yaml.Unmarshal(coreProviderComponents, &configMap)).To(Succeed())
+			Expect(yaml.Unmarshal(providerComponents, &configMap)).To(Succeed())
 
 			configMaps = append(configMaps, configMap)
 		}
 
-		By("Creating capi-system namespace")
-		namespace := &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: capiSystemNamespace,
-			},
+		By("Creating provider namespaces")
+		for _, namespaceName := range []string{capkbSystemNamespace, capiSystemNamespace} {
+			namespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: namespaceName,
+				},
+			}
+			Expect(bootstrapCluster.Create(ctx, namespace)).To(Succeed())
 		}
-		Expect(bootstrapCluster.Create(ctx, namespace)).To(Succeed())
 
-		By("Applying core provider manifests to the cluster")
+		By("Applying provider manifests to the cluster")
 		for _, cm := range configMaps {
 			Expect(bootstrapCluster.Create(ctx, &cm)).To(Succeed())
 		}
@@ -79,8 +87,9 @@ var _ = Describe("Install Core Provider in an air-gapped environment", func() {
 					FetchConfig: &operatorv1.FetchConfiguration{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
-								"provider.cluster.x-k8s.io/name": "cluster-api",
-								"provider.cluster.x-k8s.io/type": "core",
+								"provider.cluster.x-k8s.io/name":    "cluster-api",
+								"provider.cluster.x-k8s.io/type":    "core",
+								"provider.cluster.x-k8s.io/version": "v1.7.7",
 							},
 						},
 					},
@@ -108,15 +117,66 @@ var _ = Describe("Install Core Provider in an air-gapped environment", func() {
 		}), e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
 	})
 
-	It("should successfully upgrade a CoreProvider (v1.7.7 -> latest)", func() {
+	It("should successfully create a BootstrapProvider from a config map", func() {
+		bootstrapCluster := bootstrapClusterProxy.GetClient()
+		bootstrapProvider := &operatorv1.BootstrapProvider{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      customBootstrapProviderName,
+				Namespace: capkbSystemNamespace,
+			},
+			Spec: operatorv1.BootstrapProviderSpec{
+				ProviderSpec: operatorv1.ProviderSpec{
+					FetchConfig: &operatorv1.FetchConfiguration{
+						Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"provider.cluster.x-k8s.io/name":    "kubeadm",
+								"provider.cluster.x-k8s.io/type":    "bootstrap",
+								"provider.cluster.x-k8s.io/version": "v1.7.7",
+							},
+						},
+					},
+					Version: previousCAPIVersion,
+				},
+			},
+		}
+
+		Expect(bootstrapCluster.Create(ctx, bootstrapProvider)).To(Succeed())
+
+		By("Waiting for the bootstrap provider deployment to be ready")
+		framework.WaitForDeploymentsAvailable(ctx, framework.WaitForDeploymentsAvailableInput{
+			Getter:     bootstrapClusterProxy.GetClient(),
+			Deployment: &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: bootstrapProviderDeploymentName, Namespace: capkbSystemNamespace}},
+		}, e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+
+		By("Waiting for bootstrap provider to be ready")
+		WaitFor(ctx, For(bootstrapProvider).In(bootstrapCluster).ToSatisfy(
+			HaveStatusCondition(&bootstrapProvider.Status.Conditions, operatorv1.ProviderInstalledCondition),
+		), e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+
+		By("Waiting for status.InstalledVersion to be set")
+		WaitFor(ctx, For(bootstrapProvider).In(bootstrapCluster).ToSatisfy(func() bool {
+			return ptr.Equal(bootstrapProvider.Status.InstalledVersion, ptr.To(bootstrapProvider.Spec.Version))
+		}), e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+	})
+
+	It("should successfully upgrade a CoreProvider + BootstrapProvider (v1.7.7 -> v1.8.0)", func() {
 		bootstrapCluster := bootstrapClusterProxy.GetClient()
 		coreProvider := &operatorv1.CoreProvider{}
-		key := client.ObjectKey{Namespace: capiSystemNamespace, Name: coreProviderName}
-		Expect(bootstrapCluster.Get(ctx, key, coreProvider)).To(Succeed())
+		bootstrapProvider := &operatorv1.BootstrapProvider{}
 
-		coreProvider.Spec.Version = ""
+		coreKey := client.ObjectKey{Namespace: capiSystemNamespace, Name: coreProviderName}
+		Expect(bootstrapCluster.Get(ctx, coreKey, coreProvider)).To(Succeed())
+
+		bootstrapKey := client.ObjectKey{Namespace: capkbSystemNamespace, Name: customBootstrapProviderName}
+		Expect(bootstrapCluster.Get(ctx, bootstrapKey, bootstrapProvider)).To(Succeed())
+
+		coreProvider.Spec.Version = "v1.8.0"
+		coreProvider.Spec.FetchConfig.Selector.MatchLabels["provider.cluster.x-k8s.io/version"] = "v1.8.0"
+		bootstrapProvider.Spec.Version = "v1.8.0"
+		bootstrapProvider.Spec.FetchConfig.Selector.MatchLabels["provider.cluster.x-k8s.io/version"] = "v1.8.0"
 
 		Expect(bootstrapCluster.Update(ctx, coreProvider)).To(Succeed())
+		Expect(bootstrapCluster.Update(ctx, bootstrapProvider)).To(Succeed())
 
 		By("Waiting for the core provider deployment to be ready")
 		framework.WaitForDeploymentsAvailable(ctx, framework.WaitForDeploymentsAvailableInput{
@@ -132,6 +192,22 @@ var _ = Describe("Install Core Provider in an air-gapped environment", func() {
 		By("Waiting for status.InstalledVersion to be set")
 		WaitFor(ctx, For(coreProvider).In(bootstrapCluster).ToSatisfy(func() bool {
 			return ptr.Equal(coreProvider.Status.InstalledVersion, ptr.To(coreProvider.Spec.Version))
+		}), e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+
+		By("Waiting for the bootstrap provider deployment to be ready")
+		framework.WaitForDeploymentsAvailable(ctx, framework.WaitForDeploymentsAvailableInput{
+			Getter:     bootstrapClusterProxy.GetClient(),
+			Deployment: &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: bootstrapProviderDeploymentName, Namespace: capkbSystemNamespace}},
+		}, e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+
+		By("Waiting for bootstrap provider to be ready")
+		WaitFor(ctx, For(bootstrapProvider).In(bootstrapCluster).ToSatisfy(
+			HaveStatusCondition(&bootstrapProvider.Status.Conditions, operatorv1.ProviderInstalledCondition),
+		), e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+
+		By("Waiting for bootstrap provider status.InstalledVersion to be set")
+		WaitFor(ctx, For(bootstrapProvider).In(bootstrapCluster).ToSatisfy(func() bool {
+			return ptr.Equal(bootstrapProvider.Status.InstalledVersion, ptr.To(bootstrapProvider.Spec.Version))
 		}), e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
 	})
 
@@ -180,6 +256,56 @@ var _ = Describe("Install Core Provider in an air-gapped environment", func() {
 		namespace := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: capiSystemNamespace,
+			},
+		}
+		Expect(bootstrapCluster.Delete(ctx, namespace)).To(Succeed())
+	})
+
+	It("should successfully delete a BootstrapProvider", func() {
+		bootstrapCluster := bootstrapClusterProxy.GetClient()
+		bootstrapProvider := &operatorv1.BootstrapProvider{ObjectMeta: metav1.ObjectMeta{
+			Name:      customBootstrapProviderName,
+			Namespace: capkbSystemNamespace,
+		}}
+
+		Expect(bootstrapCluster.Delete(ctx, bootstrapProvider)).To(Succeed())
+
+		By("Waiting for the bootstrap provider deployment to be deleted")
+		WaitForDelete(ctx, For(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+			Name:      bootstrapProviderDeploymentName,
+			Namespace: capkbSystemNamespace,
+		}}).In(bootstrapCluster), e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+
+		By("Waiting for the bootstrap provider object to be deleted")
+		WaitForDelete(
+			ctx, For(bootstrapProvider).In(bootstrapCluster),
+			e2eConfig.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+	})
+
+	It("should successfully delete config maps with Bootstrap Provider manifests", func() {
+		bootstrapCluster := bootstrapClusterProxy.GetClient()
+		configMaps := []corev1.ConfigMap{}
+
+		for _, fileName := range []string{"bootstrap-kubeadm-v1.7.7.yaml", "bootstrap-kubeadm-v1.8.0.yaml"} {
+			bootstrapProviderComponents, err := os.ReadFile(customManifestsFolder + fileName)
+			Expect(err).ToNot(HaveOccurred(), "Failed to read the bootstrap provider manifests file")
+
+			var configMap corev1.ConfigMap
+
+			Expect(yaml.Unmarshal(bootstrapProviderComponents, &configMap)).To(Succeed())
+
+			configMaps = append(configMaps, configMap)
+		}
+
+		By("Deleting config maps with bootstrap provider manifests")
+		for _, cm := range configMaps {
+			Expect(bootstrapCluster.Delete(ctx, &cm)).To(Succeed())
+		}
+
+		By("Deleting capkb-system namespace")
+		namespace := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: capkbSystemNamespace,
 			},
 		}
 		Expect(bootstrapCluster.Delete(ctx, namespace)).To(Succeed())
